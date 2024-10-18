@@ -1,0 +1,10 @@
+===== Simulation Report =====
+Total Execution Cycles: 17209763
+Compute Cycles: 10430314
+Load/Store Instructions: 2497349
+Idle Cycles: 4282100
+Cache Hits: 2461664
+Cache Misses: 35685
+Data Traffic on Bus: 1370272 bytes
+Write-Back Cycles: 713600
+=============================
