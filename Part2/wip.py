@@ -7,11 +7,11 @@ from typing import Dict, List, Optional, Tuple, Set
 
 class CacheState(Enum):
     """Cache states for MESI and Dragon protocols"""
-    INVALID = auto()
     # MESI states
     MESI_MODIFIED = auto()
     MESI_EXCLUSIVE = auto()
     MESI_SHARED = auto()
+    INVALID = auto()
     # Dragon states
     DRAGON_MODIFIED = auto()
     DRAGON_EXCLUSIVE = auto()
@@ -38,38 +38,32 @@ class BusTransaction(Enum):
     BUS_UPDATE = auto()
 
 class DRAM:
-    def __init__(self):
-        self.access_latency = 100
-        self.total_transfer_latency = 9 # 8 for sending/receiving 4 words + 1 for receiving address on read or sending ACK after store
-        self.request_queue = deque()
-        self.current_request = None
-        self.processing_cycles_remaining = 0
+    def __init__(self, total_access_latency, bus):
+        self.bus = bus
+        self.total_access_latency = total_access_latency
+        self.request_queue = []  # Array to store requests, each with a cycle counter
+        self.total_transfer_latency = 8 + 1 # 8 cycles for data and 1 cycle for address or writeback_ack
 
-    def enqueue_request(self, request_type: str, cpu_id: int, address: Optional[int] = None):
-        self.request_queue.append({
-            'type': request_type,
-            'cpu_id': cpu_id,
-            'address': address,
-            'latency': self.access_latency - self.total_transfer_latency
-        })
+    def enqueue_request(self, transaction):
+        transaction['cycles_remaining'] = self.total_access_latency - self.total_transfer_latency
+        self.request_queue.append(transaction)
+
+    def request_bus(self, transaction):
+        self.bus.request(transaction)
+
+    def decrement_cycle_counters(self):
+        for request in self.request_queue:
+            request['cycles_remaining'] -= 1
 
     def step(self):
-        if self.current_request:
-            self.processing_cycles_remaining -= 1
-            if self.processing_cycles_remaining == 0:
-                completed_request = self.current_request
-                self.current_request = None
-                return completed_request
-        elif self.request_queue:
-            self.current_request = self.request_queue.popleft()
-            self.processing_cycles_remaining = self.current_request['latency']
-        return None
-
-    def fetch(self, address: int, size: int) -> int:
-        return self.access_latency
-
-    def write_back(self, address: int, size: int) -> int:
-        return self.access_latency
+        self.decrement_cycle_counters()
+        if not any(request['cycles_remaining'] == 0 for request in self.request_queue):
+            return
+        for request in self.request_queue:
+            if request['cycles_remaining'] == 0:
+                completed_request['from_dram'] = True
+                self.request_bus(completed_request)
+                self.request_queue = [req for req in self.request_queue if req['cycles_remaining'] > 0]  # Remove completed request
 
 class AddressHandler:
     def __init__(self, block_size: int, num_sets: int):
@@ -100,7 +94,7 @@ class CacheStatistics:
         self.misses = 0
         self.total_cycles = 0
 
-    def record_access(self, hit: bool, block_addr: int, state: Optional[CacheState] = None):
+    def record_access(self, hit: bool):
         if hit:
             self.hits += 1
         else:
@@ -118,41 +112,43 @@ class CacheStatistics:
         }
 
 class Bus:
-    def __init__(self, block_size: int, dram: DRAM):
-        self.busy = False
+    def __init__(self, block_size: int):
+        self.dram = None # Will be set later by Simulator class
+        self.caches = None # Will be set later by Simulator class
         self.queue: deque = deque()
+        self.dram_response_queue: deque = deque()
+
+        self.word_size = 4
+        self.block_size = block_size
+        
+        self.is_busy = False
         self.current_transaction = None
         self.transfer_cycles_remaining = 0
-        self.block_size = block_size
-        self.word_size = 4
         self.data_traffic = 0
         self.stats = {
             'invalidations': 0,
             'updates': 0
             }
-        self.caches = [] 
-        self.dram = dram
-        self.dram_response_queue: deque = deque()
-        self.current_dram_transaction = None
 
-    def is_busy(self) -> bool:
-        return self.busy
-
-    def grant(self, transaction: Tuple[int, Dict]):
-        self.busy = True
+    def grant(self, transaction):
+        if self.is_busy:
+            raise ValueError("Bus is already busy when trying to grant")
+        self.is_busy = True
         self.current_transaction = transaction
 
     def release(self):
+        if not self.is_busy:
+            raise ValueError("Bus is not busy when released")
         self.current_transaction = None
-        self.busy = False
+        self.is_busy = False
 
-    def request(self, transaction: Tuple[int, Dict]):
-        self.queue.append((cpu_id, transaction))
+    def request(self, transaction):
+        if transaction['from_dram']:
+            self.dram_response_queue.append(transaction)
+        else:
+            self.queue.append(transaction)
 
     def step(self):
-        dram_response = self.dram.step()
-        if dram_response:
-            self.dram_response_queue.append(dram_response)
 
         if self.transfer_cycles_remaining > 0:
             self.transfer_cycles_remaining -= 1
@@ -161,81 +157,65 @@ class Bus:
             return
 
         # Give priority to DRAM responses
-        if self.dram_response_queue:
+        if self.dram_response_queue and not self.is_busy:
             self.grant(self.dram_response_queue.popleft())
             return
         
-        if self.queue:
+        if self.queue and not self.is_busy:
             self.grant(self.queue.popleft())
             return
 
-        if self.current_transaction:
-            transaction = self.current_transaction[1]
-            transaction_type = transaction['type']
-            address = transaction['address']
-            requesting_cpu_id = self.current_transaction[0]
-
-            snoop_hit = False
-            for cache in self.caches:
-                if cache.cpu_id != requesting_cpu_id:
-                    if cache.snoop(transaction_type, address):
-                        snoop_hit = True
-
-            requesting_cache = next((c for c in self.caches if c.cpu_id == requesting_cpu_id), None)
-            if requesting_cache:
-                requesting_cache.handle_bus_transaction(snoop_hit)
-
-            self.transfer_cycles_remaining = self.calculate_transfer_cycles(transaction)
-            self.update_traffic_stats(transaction)
-            return
-
-    def calculate_transfer_cycles(self, transaction: Dict):
-        if transaction['type'] == BusTransaction.BUS_WRITEBACK:
+    def calculate_transfer_cycles(self, transaction):
+        transaction_type = transaction['type']
+        if transaction_type == BusTransaction.BUS_WRITEBACK:
             words_in_block = self.block_size // self.word_size
             return 2 * words_in_block
-        elif transaction['type'] == BusTransaction.BUS_WRITEBACK_ACK:
+        elif transaction_type == BusTransaction.BUS_WRITEBACK_ACK:
             words_in_block = self.block_size // self.word_size
             return 1
-        elif transaction['type'] == BusTransaction.BUS_READ_ADDRESS:
+        elif transaction_type == BusTransaction.BUS_READ_ADDRESS:
             return 1
-        elif transaction['type'] == BusTransaction.BUS_READ_DATA:
+        elif transaction_type == BusTransaction.BUS_READ_DATA:
             words_in_block = self.block_size // self.word_size
             return 2 * words_in_block
-        elif transaction['type'] == BusTransaction.BUS_READ_X:
+        elif transaction_type == BusTransaction.BUS_READ_X:
             return 1
-        elif transaction['type'] == BusTransaction.BUS_UPGRADE:
+        elif transaction_type == BusTransaction.BUS_UPGRADE:
             return 1 
-        elif transaction['type'] == BusTransaction.FLUSH_OPT:
+        elif transaction_type == BusTransaction.FLUSH_OPT:
             words_in_block = self.block_size // self.word_size
             return 2 * words_in_block
-        elif transaction['type'] == BusTransaction.BUS_UPDATE:
-            return 2
-        return 0
+        elif transaction_type == BusTransaction.BUS_UPDATE:
+            words_in_block = self.block_size // self.word_size
+            return 2 * words_in_block
+        raise ValueError(f"Unknown transaction type: {transaction_type}")
 
     def update_traffic_stats(self, transaction: Dict):
-        if transaction['type'] == BusTransaction.BUS_WRITEBACK:
+        transaction_type = transaction['type']
+        if transaction_type == BusTransaction.BUS_WRITEBACK:
             self.data_traffic += self.block_size
-        elif transaction['type'] == BusTransaction.BUS_WRITEBACK_ACK:
+        elif transaction_type == BusTransaction.BUS_WRITEBACK_ACK:
             pass
-        elif transaction['type'] == BusTransaction.BUS_READ_ADDRESS:
+        elif transaction_type == BusTransaction.BUS_READ_ADDRESS:
             pass
-        elif transaction['type'] == BusTransaction.BUS_READ_DATA:
+        elif transaction_type == BusTransaction.BUS_READ_DATA:
             self.data_traffic += self.block_size
-        elif transaction['type'] == BusTransaction.BUS_READ_X:
+        elif transaction_type == BusTransaction.BUS_READ_X:
             self.stats['invalidations'] += 1
-        elif transaction['type'] == BusTransaction.BUS_UPGRADE:
+        elif transaction_type == BusTransaction.BUS_UPGRADE:
             self.stats['invalidations'] += 1
-        elif transaction['type'] == BusTransaction.FLUSH_OPT:
+        elif transaction_type == BusTransaction.FLUSH_OPT:
             self.data_traffic += self.block_size
-        elif transaction['type'] == BusTransaction.BUS_UPDATE:
-            self.data_traffic += self.word_size
+        elif transaction_type == BusTransaction.BUS_UPDATE:
+            self.data_traffic += self.block_size
             self.stats['updates'] += 1
+        else:
+            raise ValueError(f"Unknown transaction type: {transaction_type}")
 
     def complete_transaction(self):
-        transaction = self.current_transaction[1]
-        cpu_id = self.current_transaction[0]
+        transaction = self.current_transaction
         if transaction['type'] == BusTransaction.BUS_WRITEBACK:
-            self.dram.enqueue_request(Operation.STORE, cpu_id, transaction['address'])
+            self.dram.enqueue_request(Operation.STORE, transaction)
             cache = next((c for c in self.caches if c.cpu_id == cpu_id), None)
             if cache:
                 cache.notify_write_back_complete()
@@ -255,22 +235,20 @@ class CacheBlock:
         return hash((self.tag, self.set_index))
 
 class Cache:
-    def __init__(self, cpu_id, size, block_size, associativity, bus, dram, protocol):
+    def __init__(self, cpu_id, size, block_size, associativity, bus, protocol):
         self.cpu_id = cpu_id
+        self.bus = bus
         self.word_size = 4
         self.size = size
         self.block_size = block_size
         self.associativity = associativity
         self.num_sets = size // (block_size * associativity)
         self.cache = {i: deque(maxlen=associativity) for i in range(self.num_sets)}
-        self.bus = bus
-        self.dram = dram
         self.protocol = protocol 
         self.private_accesses = 0
         self.shared_accesses = 0
         self.stats = CacheStatistics()
         self.address_handler = AddressHandler(block_size, self.num_sets)
-        self.memory_fetch_cycles_remaining = 0 
         self.pending_writeback_ack = False
         self.pending_miss_info = None
         self.is_blocking = False
@@ -308,14 +286,24 @@ class Cache:
         self.pending_miss_info = None
         self.is_blocking = False
 
+    # Successfull writeback due to eviction on cache miss
+    # Now we need to perform the memory operation that caused the cache miss
     def handle_dram_ack(self):
         if not self.pending_writeback_ack or not self.pending_miss_info:
             raise ValueError("No pending writeback ack expected")
         self.pending_writeback_ack = False
         pending_operation = self.pending_miss_info['operation']
-        transaction_type = BusTransaction.BUS_READ_X if pending_operation == Operation.STORE else BusTransaction.BUS_READ_ADDRESS
-        block_address = self.address_handler.get_block_address(self.pending_miss_info['address'])
-        self.request_bus((self.cpu_id, {'type': transaction_type, 'address': block_address}))
+        if self.protocol == 'MESI':
+            if pending_operation == Operation.STORE:
+                transaction_type = BusTransaction.BUS_READ_X
+            elif pending_operation == Operation.LOAD:
+                transaction_type = BusTransaction.BUS_READ_ADDRESS
+        elif self.protocol == 'Dragon':
+            if pending_operation == Operation.STORE:
+                transaction_type = BusTransaction.BUS_UPDATE
+            elif pending_operation == Operation.LOAD:
+                transaction_type = BusTransaction.BUS_READ_ADDRESS
+        self.request_bus({'type': transaction_type, 'address': self.pending_miss_info['address']})
 
     def change_block_state(self, block, new_state):
         block.state = new_state
@@ -324,20 +312,20 @@ class Cache:
         set_index, tag = self.get_set_index_and_tag(address)
         block = self.find_block(set_index, tag)
         if block and block.state != CacheState.INVALID:
-            self.process_cache_hit(block, operation)
+            self.process_cache_hit(block, operation, address)
         else:
-            self.process_cache_miss(set_index, tag, operation, address)
             self.shared_accesses += 1
+            self.process_cache_miss(set_index, tag, operation, address)
 
-    def process_cache_hit(self, block, operation: Operation):
-        self.stats.record_access(True, block.address, block.state)
+    def process_cache_hit(self, block, operation, address):
+        self.stats.record_access(True)
         self.update_lru(block)
         if self.protocol == 'MESI':
-            self.mesi_hit(block, operation)
+            self.mesi_hit(block, operation, address)
         elif self.protocol == 'Dragon':
-            self.dragon_hit(block, operation)
+            self.dragon_hit(block, operation, address)
 
-    def mesi_hit(self, block, operation: Operation):
+    def mesi_hit(self, block, operation, address):
         if block.state == CacheState.MESI_MODIFIED:
             self.private_accesses += 1
         elif block.state == CacheState.MESI_EXCLUSIVE:
@@ -346,12 +334,12 @@ class Cache:
             self.private_accesses += 1
         elif block.state == CacheState.MESI_SHARED:
             if operation == Operation.STORE:
-                self.request_bus((self.cpu_id, {'type': BusTransaction.BUS_UPGRADE, 'address': block.address}))
+                self.request_bus({'type': BusTransaction.BUS_UPGRADE, 'address': address})
             self.shared_accesses += 1
         else:
             raise ValueError(f"Invalid block state: {block.state}")
 
-    def dragon_hit(self, block, operation: Operation):
+    def dragon_hit(self, block, operation, address):
         if block.state == CacheState.DRAGON_MODIFIED:
             self.private_accesses += 1
         elif block.state == CacheState.DRAGON_EXCLUSIVE:
@@ -361,19 +349,18 @@ class Cache:
         elif block.state == CacheState.DRAGON_SHARED_CLEAN:
             if operation == Operation.STORE:
                 self.change_block_state(block, CacheState.DRAGON_SHARED_MODIFIED)
-                self.bus.request((self.cpu_id, {'type': BusTransaction.BUS_UPDATE, 'address': block.address}))
+                self.request_bus({'type': BusTransaction.BUS_UPDATE, 'address': address})
             self.shared_accesses += 1
         elif block.state == CacheState.DRAGON_SHARED_MODIFIED:
             if operation == Operation.STORE:
-                self.bus.request((self.cpu_id, {'type': BusTransaction.BUS_UPDATE, 'address': block.address}))
+                self.request_bus({'type': BusTransaction.BUS_UPDATE, 'address': address})
             self.shared_accesses += 1
         else:
             raise ValueError(f"Invalid block state: {block.state}")
 
     def process_cache_miss(self, set_index, tag, operation, address):
-        block_address = self.address_handler.get_block_address(address)
-        self.stats.record_access(False, block_address, None)
-        if self.evict_if_needed(set_index):
+        self.stats.record_access(False)
+        if self.evict_if_needed(set_index, address):
             self.pending_writeback_ack = True
             self.pending_miss_info = {
                 'set_index': set_index,
@@ -383,25 +370,28 @@ class Cache:
             }
             return
 
+        # No eviction
         if self.protocol == 'MESI':
             if operation == Operation.STORE:
-                self.request_bus((self.cpu_id, {'type': BusTransaction.BUS_READ_X, 'address': address}))
-            else:
-                self.request_bus((self.cpu_id, {'type': BusTransaction.BUS_READ, 'address': address}))
+                transaction_type = BusTransaction.BUS_READ_X
+            elif operation == Operation.LOAD:
+                transaction_type = BusTransaction.BUS_READ_ADDRESS
         elif self.protocol == 'Dragon':
-            self.request_bus((self.cpu_id, {'type': BusTransaction.BUS_READ, 'address': address}))
+            transaction_type = BusTransaction.BUS_READ_ADDRESS
 
-    def evict_if_needed(self, set_index):
+        self.request_bus({'type': transaction_type, 'address': address})
+
+    def evict_if_needed(self, set_index, address):
         if len(self.cache[set_index]) == self.associativity:
             evicted_block = self.cache[set_index].popleft()
             if evicted_block.state in [CacheState.MESI_MODIFIED, CacheState.DRAGON_MODIFIED, CacheState.DRAGON_SHARED_MODIFIED]:
-                self.request_bus((self.cpu_id, {'type': BusTransaction.BUS_WRITEBACK, 'address': evicted_block.address}))
+                self.request_bus({'type': BusTransaction.BUS_WRITEBACK, 'address': address})
                 return True
         return False
 
     def step(self):
-        if self.is_blocking:
-            return
+        if self.bus.new_transaction:
+            self.snoop(self.bus.newest_transaction)
 
     def shared_with_other_caches(self, address):
         for cache in self.bus.caches:
@@ -411,24 +401,33 @@ class Cache:
                 if block and block.state != CacheState.INVALID:
                     return True
         return False
-
-    def snoop(self, transaction_type: BusTransaction, address: int) -> bool:
-        set_index, tag = self.get_set_index_and_tag(address)
+    def snoop_self(self, transaction):
+        set_index, tag = self.get_set_index_and_tag(transaction['address'])
         block = self.find_block(set_index, tag)
-        if not block or block.state == CacheState.INVALID:
-            return False
+        transaction_type = transaction['type']
+
+    def snoop_other(self, transaction):
+        set_index, tag = self.get_set_index_and_tag(transaction['address'])
+        address = transaction['address']
+        block = self.find_block(set_index, tag)
+        transaction_type = transaction['type']
 
         if self.protocol == 'MESI':
-            if transaction_type == BusTransaction.BUS_READ_ADDRESS:
-                if block.state in [CacheState.MESI_MODIFIED, CacheState.MESI_EXCLUSIVE]:
-                    self.request_bus_snooping((self.cpu_id, {'type': BusTransaction.FLUSH_OPT, 'address': block.address}))
-                    self.change_block_state(block, CacheState.MESI_SHARED)
-            elif transaction_type == BusTransaction.BUS_READ_X:
-                if block.state in [CacheState.MESI_MODIFIED, CacheState.MESI_EXCLUSIVE]:
-                    self.request_bus_snooping((self.cpu_id, {'type': BusTransaction.FLUSH_OPT, 'address': block.address}))
-                self.change_block_state(block, CacheState.INVALID)
-            elif transaction_type == BusTransaction.BUS_WRITEBACK:
-                self.change_block_state(block, CacheState.INVALID)
+            if block and not block.state == CacheState.INVALID:
+                if transaction_type == BusTransaction.BUS_READ_ADDRESS:
+                    if block.state in [CacheState.MESI_MODIFIED, CacheState.MESI_EXCLUSIVE]:
+                        self.request_bus_snooping({'type': BusTransaction.FLUSH_OPT, 'address': address})
+                elif transaction_type == BusTransaction.BUS_READ_X:
+                    if block.state in [CacheState.MESI_MODIFIED, CacheState.MESI_EXCLUSIVE]:
+                        self.request_bus_snooping({'type': BusTransaction.FLUSH_OPT, 'address': address})
+                    self.change_block_state(block, CacheState.INVALID)
+                elif transaction_type == BusTransaction.BUS_UPGRADE:
+                    self.change_block_state(block, CacheState.INVALID)
+                elif transaction_type == BusTransaction.BUS_WRITEBACK:
+                    pass
+            if self.pending_miss_info['address'] == transaction['address']:
+                if transaction_type == BusTransaction.BUS_WRITEBACK_ACK:
+                    self.handle_dram_ack()
         
         elif self.protocol == 'Dragon':
             if transaction_type == BusTransaction.BUS_READ_ADDRESS:
@@ -439,16 +438,24 @@ class Cache:
             elif transaction_type == BusTransaction.BUS_UPDATE:
                 if block.state == CacheState.DRAGON_SHARED_MODIFIED:
                     self.change_block_state(block, CacheState.DRAGON_SHARED_CLEAN)
-        return True
 
-    def request_bus_snooping(self, transaction: Tuple[int, Dict]):
-        # Handle snooping bus requests without affecting outstanding requests
+    def snoop(self, transaction):
+        if transaction['cpu_id'] == self.cpu_id and not transaction['from_dram']:
+            self.snoop_self(transaction)
+        else:
+            self.snoop_other(transaction)
+
+    def request_bus_snooping(self, transaction):
+        transaction['cpu_id'] = self.cpu_id
+        transaction['from_dram'] = False
         self.bus.request(transaction)
 
-    def request_bus(self, transaction: Tuple[int, Dict]):
-        if self.is_blocking:
+    def request_bus(self, transaction):
+        if self.is_blocking: 
             raise RuntimeError("CPU is already waiting for the bus, cannot make another request originating from the CPU")
-        self.is_blocking = True
+        self.is_blocking = True # Should only block when servicing bus requests originating from the CPU
+        transaction['cpu_id'] = self.cpu_id
+        transaction['from_dram'] = False
         self.blocking_transaction = transaction
         self.bus.request(transaction)
 
@@ -472,19 +479,20 @@ class CPU:
     def __init__(self, cpu_id, cache, trace_file):
         self.cpu_id = cpu_id
         self.cache = cache
+        self.trace = self.load_trace(trace_file)
+
+        self.total_cycles = 0
         self.compute_cycles = 0
-        self.load_store_instructions = 0
         self.idle_cycles = 0
-        self.trace_file = trace_file
-        self.trace = self.load_trace()
+        self.load_store_instructions = 0
+        
         self.instruction_pointer = 0
         self.compute_cycles_remaining = 0
-        self.total_cycles = 0
 
-    def load_trace(self):
+    def load_trace(self, trace_file):
         instructions = []
         try:
-            with open(self.trace_file, 'r') as file:
+            with open(trace_file, 'r') as file:
                 for line in file:
                     parts = line.strip().split()
                     if len(parts) != 2:
@@ -535,30 +543,38 @@ class Simulator:
         self.associativity = associativity
         self.block_size = block_size
         self.num_cores = 4
-        self.dram = DRAM()
-        self.bus = Bus(self.block_size, self.dram)
-        self.cpus = []
-        self.initialize_cores()
         self.global_cycle = 0
 
-    def initialize_cores(self):
-        self.bus.caches = []
+        # Initialize core components
+        self.bus = Bus(self.block_size)
+        self.dram = DRAM(100, self.bus)
+        self.caches = []
+        self.cpus = []
+
         for i in range(self.num_cores):
             trace_file = f"{self.input_file}_{i}.data.txt"
-            cache = Cache(i, self.cache_size, self.block_size, self.associativity, self.bus, self.dram, self.protocol)
-            self.bus.caches.append(cache)
+            cache = Cache(i, self.cache_size, self.block_size, self.associativity, self.bus, self.protocol)
             cpu = CPU(i, cache, trace_file)
+            self.caches.append(cache)
             self.cpus.append(cpu)
+        
+        # Initialize cross-references
+        self.initialize_connections()
+
+    def initialize_connections(self):
+        self.bus.dram = self.dram
+        self.bus.caches = self.caches
 
     def run(self):
         logging.info("Starting simulation...")
         while not self.all_programs_finished():
             self.global_cycle += 1
-            self.bus.step() 
-            for cache in self.bus.caches:
-                cache.step()
             for cpu in self.cpus:
                 cpu.step()
+            for cache in self.bus.caches:
+                cache.step()
+            self.bus.step() 
+            self.dram.step()
         self.generate_report()
 
     def all_programs_finished(self):
