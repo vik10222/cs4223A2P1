@@ -1,0 +1,49 @@
+===== Simulation Report =====
+Overall Execution Cycles: 48059884
+Total Data Traffic on Bus: 11178960 bytes
+Number of Updates: 5484
+--- CPU 0 ---
+Total Cycles: 46739368
+Compute Cycles: 11337782
+Load/Store Instructions: 2576503
+Idle Cycles: 32825083
+Cache Hits: 2425713
+Cache Misses: 301580
+Hit Rate: 88.94%
+Miss Rate: 11.06%
+Private Accesses: 2143782
+Shared Accesses: 432721
+--- CPU 1 ---
+Total Cycles: 44439446
+Compute Cycles: 11290799
+Load/Store Instructions: 2407844
+Idle Cycles: 30740803
+Cache Hits: 2275065
+Cache Misses: 265558
+Hit Rate: 89.55%
+Miss Rate: 10.45%
+Private Accesses: 1984770
+Shared Accesses: 423074
+--- CPU 2 ---
+Total Cycles: 48059884
+Compute Cycles: 11337671
+Load/Store Instructions: 2604189
+Idle Cycles: 34118024
+Cache Hits: 2444028
+Cache Misses: 320322
+Hit Rate: 88.41%
+Miss Rate: 11.59%
+Private Accesses: 2220386
+Shared Accesses: 383803
+--- CPU 3 ---
+Total Cycles: 44419833
+Compute Cycles: 11301515
+Load/Store Instructions: 2411465
+Idle Cycles: 30706853
+Cache Hits: 2279900
+Cache Misses: 263130
+Hit Rate: 89.65%
+Miss Rate: 10.35%
+Private Accesses: 1989187
+Shared Accesses: 422278
+=============================
