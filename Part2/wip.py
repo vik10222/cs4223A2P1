@@ -1,6 +1,7 @@
 import sys
 import logging
 import math
+import copy
 from collections import deque, defaultdict
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Set
@@ -30,12 +31,15 @@ class BusTransaction(Enum):
     BUS_WRITEBACK_ACK = auto()
     BUS_READ_ADDRESS = auto()
     BUS_READ_DATA = auto()
+    # Bus transaction between caches
+    BUS_READ = auto()
     # MESI-specific bus transactions between caches
     BUS_READ_X = auto()
     BUS_UPGRADE = auto()
     FLUSH_OPT = auto()
     # Dragon-specific bus transactions between caches
     BUS_UPDATE = auto()
+    FLUSH = auto()
 
 class DRAM:
     def __init__(self, total_access_latency, bus):
@@ -44,49 +48,53 @@ class DRAM:
         self.request_queue = []  # Array to store requests, each with a cycle counter
         self.total_transfer_latency = 8 + 1 # 8 cycles for data and 1 cycle for address or writeback_ack
 
-    def enqueue_request(self, transaction):
-        transaction['cycles_remaining'] = self.total_access_latency - self.total_transfer_latency
-        self.request_queue.append(transaction)
-
     def request_bus(self, transaction):
+        if transaction['type'] == BusTransaction.BUS_READ_ADDRESS:
+            transaction['type'] = BusTransaction.BUS_READ_DATA
+        elif transaction['type'] == BusTransaction.BUS_WRITEBACK:
+            transaction['type'] = BusTransaction.BUS_WRITEBACK_ACK
         self.bus.request(transaction)
 
     def decrement_cycle_counters(self):
         for request in self.request_queue:
             request['cycles_remaining'] -= 1
 
+    def snoop(self, transaction):
+        if transaction['type'] in [BusTransaction.BUS_READ_ADDRESS, BusTransaction.BUS_WRITEBACK]:
+            request = copy.deepcopy(transaction)
+            request['cycles_remaining'] = self.total_access_latency - self.total_transfer_latency
+            self.request_queue.append(request)
+
     def step(self):
+        if self.bus.new_transaction:
+            self.snoop(self.bus.current_transaction)
         self.decrement_cycle_counters()
         if not any(request['cycles_remaining'] == 0 for request in self.request_queue):
             return
         for request in self.request_queue:
             if request['cycles_remaining'] == 0:
-                completed_request['from_dram'] = True
-                self.request_bus(completed_request)
+                request['from_dram'] = True
+                self.request_bus(request)
                 self.request_queue = [req for req in self.request_queue if req['cycles_remaining'] > 0]  # Remove completed request
 
 class AddressHandler:
-    def __init__(self, block_size: int, num_sets: int):
+    def __init__(self, block_size, num_sets):
         if (block_size & (block_size - 1)) != 0:
             raise ValueError("Block size must be a power of 2")
         if (num_sets & (num_sets - 1)) != 0:
             raise ValueError("Number of sets must be a power of 2")
         
-        self.block_size = block_size
         self.num_sets = num_sets
         self.block_offset_bits = int(math.log2(block_size))
         self.index_bits = int(math.log2(num_sets))
-        self.tag_bits = 32 - self.block_offset_bits - self.index_bits
 
-    def parse_address(self, address: int) -> Tuple[int, int, int]:
-        address &= 0xFFFFFFFF  # Ensure 32-bit
-        offset = address & (self.block_size - 1)
-        index = (address >> self.block_offset_bits) & (self.num_sets - 1)
-        tag = address >> (self.block_offset_bits + self.index_bits)
-        return tag, index, offset
+    def get_set_index_and_tag(self, block_address):
+        index = (block_address >> self.block_offset_bits) & (self.num_sets - 1)
+        tag = block_address >> (self.index_bits + self.block_offset_bits)
+        return index, tag
 
-    def get_block_address(self, address: int) -> int:
-        return address & ~(self.block_size - 1)
+    def get_block_address(self, address):
+        return address >> self.block_offset_bits
 
 class CacheStatistics:
     def __init__(self):
@@ -121,7 +129,7 @@ class Bus:
         self.word_size = 4
         self.block_size = block_size
         
-        self.is_busy = False
+        self.new_transaction = False
         self.current_transaction = None
         self.transfer_cycles_remaining = 0
         self.data_traffic = 0
@@ -131,62 +139,67 @@ class Bus:
             }
 
     def grant(self, transaction):
-        if self.is_busy:
-            raise ValueError("Bus is already busy when trying to grant")
-        self.is_busy = True
+        self.new_transaction = True # Only True for first cycle
         self.current_transaction = transaction
+        self.update_traffic_stats(transaction)
+        self.transfer_cycles_remaining = self.calculate_transfer_cycles(transaction) - 1 # -1 to account for current cycle
+        for cache in self.caches:
+            cache.update_shared_line(transaction)
 
     def release(self):
-        if not self.is_busy:
-            raise ValueError("Bus is not busy when released")
+        if self.transfer_cycles_remaining != 0:
+            raise ValueError("Bus is still busy when trying to release")
         self.current_transaction = None
-        self.is_busy = False
 
     def request(self, transaction):
-        if transaction['from_dram']:
-            self.dram_response_queue.append(transaction)
+        transaction_copy = copy.deepcopy(transaction)
+        # We prioritize DRAM requests and responses
+        if transaction_copy['from_dram'] or transaction_copy['type'] in [BusTransaction.BUS_READ_ADDRESS, BusTransaction.BUS_WRITEBACK]:
+            self.dram_response_queue.append(transaction_copy)
         else:
             self.queue.append(transaction)
 
     def step(self):
+        self.new_transaction = False
 
         if self.transfer_cycles_remaining > 0:
             self.transfer_cycles_remaining -= 1
-            if self.transfer_cycles_remaining == 0:
-                self.complete_transaction()
             return
 
+        if self.current_transaction:
+            self.release()
+
         # Give priority to DRAM responses
-        if self.dram_response_queue and not self.is_busy:
+        if self.dram_response_queue:
             self.grant(self.dram_response_queue.popleft())
             return
         
-        if self.queue and not self.is_busy:
+        if self.queue:
             self.grant(self.queue.popleft())
             return
 
     def calculate_transfer_cycles(self, transaction):
+        words_in_block = self.block_size // self.word_size
         transaction_type = transaction['type']
         if transaction_type == BusTransaction.BUS_WRITEBACK:
-            words_in_block = self.block_size // self.word_size
             return 2 * words_in_block
         elif transaction_type == BusTransaction.BUS_WRITEBACK_ACK:
-            words_in_block = self.block_size // self.word_size
             return 1
         elif transaction_type == BusTransaction.BUS_READ_ADDRESS:
             return 1
         elif transaction_type == BusTransaction.BUS_READ_DATA:
-            words_in_block = self.block_size // self.word_size
             return 2 * words_in_block
+        elif transaction_type == BusTransaction.BUS_READ:
+            return 1
         elif transaction_type == BusTransaction.BUS_READ_X:
             return 1
         elif transaction_type == BusTransaction.BUS_UPGRADE:
             return 1 
         elif transaction_type == BusTransaction.FLUSH_OPT:
-            words_in_block = self.block_size // self.word_size
             return 2 * words_in_block
         elif transaction_type == BusTransaction.BUS_UPDATE:
-            words_in_block = self.block_size // self.word_size
+            return 2 * words_in_block
+        elif transaction_type == BusTransaction.FLUSH:
             return 2 * words_in_block
         raise ValueError(f"Unknown transaction type: {transaction_type}")
 
@@ -200,6 +213,8 @@ class Bus:
             pass
         elif transaction_type == BusTransaction.BUS_READ_DATA:
             self.data_traffic += self.block_size
+        elif transaction_type == BusTransaction.BUS_READ:
+            pass
         elif transaction_type == BusTransaction.BUS_READ_X:
             self.stats['invalidations'] += 1
         elif transaction_type == BusTransaction.BUS_UPGRADE:
@@ -209,17 +224,10 @@ class Bus:
         elif transaction_type == BusTransaction.BUS_UPDATE:
             self.data_traffic += self.block_size
             self.stats['updates'] += 1
+        elif transaction_type == BusTransaction.FLUSH:
+            self.data_traffic += self.block_size
         else:
             raise ValueError(f"Unknown transaction type: {transaction_type}")
-
-    def complete_transaction(self):
-        transaction = self.current_transaction
-        if transaction['type'] == BusTransaction.BUS_WRITEBACK:
-            self.dram.enqueue_request(Operation.STORE, transaction)
-            cache = next((c for c in self.caches if c.cpu_id == cpu_id), None)
-            if cache:
-                cache.notify_write_back_complete()
-        self.release()
 
 class CacheBlock:
     def __init__(self, tag, set_index):
@@ -249,83 +257,48 @@ class Cache:
         self.shared_accesses = 0
         self.stats = CacheStatistics()
         self.address_handler = AddressHandler(block_size, self.num_sets)
-        self.pending_writeback_ack = False
-        self.pending_miss_info = None
+
+        self.shared_line = False
+        self.pending_writeback_ack_address = None
         self.is_blocking = False
+        self.is_blocking_info = None
 
-    def handle_bus_transaction(self, snoop_hit: bool):
-        if not self.pending_miss_info:
-            raise Exception("No pending miss info, when expected")
-        set_index = self.pending_miss_info['set_index']
-        tag = self.pending_miss_info['tag']
-        operation = self.pending_miss_info['operation']
-        address = self.pending_miss_info['address']
-        block = CacheBlock(tag, set_index)
-        block.address = self.address_handler.get_block_address(address)
-        self.cache[set_index].append(block)
-        self.update_lru(block)
+    def update_shared_line(self, transaction):
+        if any(cache.shared_line for cache in self.bus.caches if cache != self):
+            return # Shared line already asserted by another cache
+        if transaction['type'] not in [BusTransaction.BUS_READ, BusTransaction.BUS_READ_X, BusTransaction.BUS_UPDATE]:
+            return # Transaction type does not concern the shared line
+        block_address = transaction['block_address']
+        set_index, tag = self.address_handler.get_set_index_and_tag(block_address)
+        block = self.find_block(set_index, tag)
+        if block and block.state != CacheState.INVALID:
+            self.shared_line = True # This cache is now guaranteed to be the sole asserter of the shared line
 
-        if self.protocol == 'MESI':
-            transaction_type = self.pending_miss_info['operation']
-            if transaction_type == Operation.STORE:
-                block.state = CacheState.MESI_MODIFIED
-            elif transaction_type == Operation.LOAD:
-                if snoop_hit:
-                    block.state = CacheState.MESI_SHARED
-                else:
-                    block.state = CacheState.MESI_EXCLUSIVE
-
-        elif self.protocol == 'Dragon':
-            if transaction_type == Operation.STORE:
-                block.state = CacheState.DRAGON_MODIFIED
-            elif transaction_type == Operation.LOAD:
-                if snoop_hit:
-                    block.state = CacheState.DRAGON_SHARED_MODIFIED
-                else:
-                    block.state = CacheState.DRAGON_EXCLUSIVE
-        self.pending_miss_info = None
-        self.is_blocking = False
-
-    # Successfull writeback due to eviction on cache miss
-    # Now we need to perform the memory operation that caused the cache miss
-    def handle_dram_ack(self):
-        if not self.pending_writeback_ack or not self.pending_miss_info:
-            raise ValueError("No pending writeback ack expected")
-        self.pending_writeback_ack = False
-        pending_operation = self.pending_miss_info['operation']
-        if self.protocol == 'MESI':
-            if pending_operation == Operation.STORE:
-                transaction_type = BusTransaction.BUS_READ_X
-            elif pending_operation == Operation.LOAD:
-                transaction_type = BusTransaction.BUS_READ_ADDRESS
-        elif self.protocol == 'Dragon':
-            if pending_operation == Operation.STORE:
-                transaction_type = BusTransaction.BUS_UPDATE
-            elif pending_operation == Operation.LOAD:
-                transaction_type = BusTransaction.BUS_READ_ADDRESS
-        self.request_bus({'type': transaction_type, 'address': self.pending_miss_info['address']})
+    def shared_line_asserted(self):
+        return any(cache.shared_line for cache in self.bus.caches if cache != self)
 
     def change_block_state(self, block, new_state):
         block.state = new_state
 
     def access(self, address, operation):
-        set_index, tag = self.get_set_index_and_tag(address)
+        block_address = self.address_handler.get_block_address(address)
+        set_index, tag = self.address_handler.get_set_index_and_tag(address)
         block = self.find_block(set_index, tag)
         if block and block.state != CacheState.INVALID:
-            self.process_cache_hit(block, operation, address)
+            self.process_cache_hit(block, operation, block_address)
         else:
             self.shared_accesses += 1
-            self.process_cache_miss(set_index, tag, operation, address)
+            self.process_cache_miss(set_index, tag, operation, block_address)
 
-    def process_cache_hit(self, block, operation, address):
+    def process_cache_hit(self, block, operation, block_address):
         self.stats.record_access(True)
         self.update_lru(block)
         if self.protocol == 'MESI':
-            self.mesi_hit(block, operation, address)
+            self.mesi_hit(block, operation, block_address)
         elif self.protocol == 'Dragon':
-            self.dragon_hit(block, operation, address)
+            self.dragon_hit(block, operation, block_address)
 
-    def mesi_hit(self, block, operation, address):
+    def mesi_hit(self, block, operation, block_address):
         if block.state == CacheState.MESI_MODIFIED:
             self.private_accesses += 1
         elif block.state == CacheState.MESI_EXCLUSIVE:
@@ -334,12 +307,12 @@ class Cache:
             self.private_accesses += 1
         elif block.state == CacheState.MESI_SHARED:
             if operation == Operation.STORE:
-                self.request_bus({'type': BusTransaction.BUS_UPGRADE, 'address': address})
+                self.request_bus({'type': BusTransaction.BUS_UPGRADE, 'block_address': block_address})
             self.shared_accesses += 1
         else:
             raise ValueError(f"Invalid block state: {block.state}")
 
-    def dragon_hit(self, block, operation, address):
+    def dragon_hit(self, block, operation, block_address):
         if block.state == CacheState.DRAGON_MODIFIED:
             self.private_accesses += 1
         elif block.state == CacheState.DRAGON_EXCLUSIVE:
@@ -349,119 +322,240 @@ class Cache:
         elif block.state == CacheState.DRAGON_SHARED_CLEAN:
             if operation == Operation.STORE:
                 self.change_block_state(block, CacheState.DRAGON_SHARED_MODIFIED)
-                self.request_bus({'type': BusTransaction.BUS_UPDATE, 'address': address})
+                self.request_bus({'type': BusTransaction.BUS_UPDATE, 'block_address': block_address})
             self.shared_accesses += 1
         elif block.state == CacheState.DRAGON_SHARED_MODIFIED:
             if operation == Operation.STORE:
-                self.request_bus({'type': BusTransaction.BUS_UPDATE, 'address': address})
+                self.request_bus({'type': BusTransaction.BUS_UPDATE, 'block_address': block_address})
             self.shared_accesses += 1
         else:
             raise ValueError(f"Invalid block state: {block.state}")
 
-    def process_cache_miss(self, set_index, tag, operation, address):
+    def evict_and_writeback_needed(self, set_index, block_address):
+        if len(self.cache[set_index]) == self.associativity:
+            evicted_block = copy.deepcopy(self.cache[set_index].popleft())
+            # TODO: In DRAGON_SHARED_MODIFIED, another cache might want to adopt the evicted block by asserting the shared line
+            # If so, we avoid the long way to main memory
+            # This logic is somewhat tricky, will implement if I have the time, as this is merely an optimization
+            if evicted_block.state in [CacheState.MESI_MODIFIED, CacheState.DRAGON_MODIFIED, CacheState.DRAGON_SHARED_MODIFIED]:
+                return evicted_block
+        return None
+
+    def process_cache_miss(self, set_index, tag, operation, block_address):
         self.stats.record_access(False)
-        if self.evict_if_needed(set_index, address):
-            self.pending_writeback_ack = True
-            self.pending_miss_info = {
-                'set_index': set_index,
-                'tag': tag,
-                'operation': operation,
-                'address': address
-            }
-            return
+        self.is_blocking_info = {
+            'set_index': set_index,
+            'tag': tag,
+            'operation': operation,
+            'block_address': block_address
+        }
+        evicted_block = self.evict_and_writeback_needed(set_index, block_address)
+        if evicted_block:
+            self.request_bus({'type': BusTransaction.BUS_WRITEBACK, 'block_address': evicted_block.address})
+            self.pending_writeback_ack_address = evicted_block.address
+            return # Will request block after successful writeback
 
         # No eviction
+        self.request_block_on_miss()
+
+    # Successfull writeback due to eviction on cache miss
+    # Now we need to perform the memory operation that caused the cache miss
+    def handle_dram_ack(self):
+        if not (self.pending_writeback_ack_address and self.is_blocking_info):
+            raise ValueError("No pending writeback ack expected")
+        self.pending_writeback_ack_address = None
+        self.is_blocking = False
+
+        self.request_block_on_miss()
+
+    def request_block_on_miss(self):
+        operation = self.is_blocking_info['operation']
+        block_address = self.is_blocking_info['block_address']
         if self.protocol == 'MESI':
             if operation == Operation.STORE:
                 transaction_type = BusTransaction.BUS_READ_X
             elif operation == Operation.LOAD:
-                transaction_type = BusTransaction.BUS_READ_ADDRESS
+                transaction_type = BusTransaction.BUS_READ
         elif self.protocol == 'Dragon':
-            transaction_type = BusTransaction.BUS_READ_ADDRESS
-
-        self.request_bus({'type': transaction_type, 'address': address})
-
-    def evict_if_needed(self, set_index, address):
-        if len(self.cache[set_index]) == self.associativity:
-            evicted_block = self.cache[set_index].popleft()
-            if evicted_block.state in [CacheState.MESI_MODIFIED, CacheState.DRAGON_MODIFIED, CacheState.DRAGON_SHARED_MODIFIED]:
-                self.request_bus({'type': BusTransaction.BUS_WRITEBACK, 'address': address})
-                return True
-        return False
+            transaction_type = BusTransaction.BUS_READ
+        self.request_bus({'type': transaction_type, 'block_address': block_address})
 
     def step(self):
         if self.bus.new_transaction:
-            self.snoop(self.bus.newest_transaction)
+            self.snoop(self.bus.current_transaction)
 
-    def shared_with_other_caches(self, address):
-        for cache in self.bus.caches:
-            if cache.cpu_id != self.cpu_id:
-                set_index, tag = cache.get_set_index_and_tag(address)
-                block = cache.find_block(set_index, tag)
-                if block and block.state != CacheState.INVALID:
-                    return True
+    def snoop_mesi_self(self, transaction):
+        set_index, tag = self.address_handler.get_set_index_and_tag(transaction['block_address'])
+        block_address = transaction['block_address']
+        block = self.find_block(set_index, tag)
+        if not (block or self.is_blocking):
+            return # Nothing to contribute or gain
+        transaction_type = transaction['type']
+
+        if transaction_type in [BusTransaction.BUS_READ, BusTransaction.BUS_READ_X] and not self.shared_line_asserted():
+            self.is_blocking = False
+            self.request_bus({'type': BusTransaction.BUS_READ_ADDRESS, 'block_address': block_address})
+        elif transaction_type == BusTransaction.BUS_UPGRADE and not self.shared_line_asserted():
+            self.is_blocking = False
+            block.state = CacheState.MESI_MODIFIED
+
+    def resolve_mesi_miss(self, transaction, new_block):
+        operation = self.is_blocking_info['operation']
+        transaction_type = transaction['type']
+        if operation == Operation.STORE:
+            if transaction_type in [BusTransaction.FLUSH_OPT, BusTransaction.BUS_READ_DATA]:
+                self.change_block_state(new_block, CacheState.MESI_MODIFIED)
+                return True
+        elif operation == Operation.LOAD:
+            if transaction_type == BusTransaction.FLUSH_OPT:
+                self.change_block_state(new_block, CacheState.MESI_SHARED)
+                return True
+            elif transaction_type == BusTransaction.BUS_READ_DATA:
+                self.change_block_state(new_block, CacheState.MESI_EXCLUSIVE)
+                return True
         return False
-    def snoop_self(self, transaction):
-        set_index, tag = self.get_set_index_and_tag(transaction['address'])
+
+    def resolve_dragon_miss(self, transaction, new_block):
+        operation = self.is_blocking_info['operation']
+        transaction_type = transaction['type']
+        if operation == Operation.STORE:
+            if transaction_type in [BusTransaction.FLUSH, BusTransaction.BUS_UPDATE]:
+                self.change_block_state(new_block, CacheState.DRAGON_SHARED_CLEAN)
+                return True
+            elif transaction_type == BusTransaction.BUS_READ_DATA:
+                self.change_block_state(new_block, CacheState.DRAGON_MODIFIED)
+                return True
+        elif operation == Operation.LOAD:
+            if transaction_type in [BusTransaction.FLUSH, BusTransaction.BUS_UPDATE]:
+                self.change_block_state(new_block, CacheState.DRAGON_SHARED_CLEAN)
+                return True
+            elif transaction_type == BusTransaction.BUS_READ_DATA:
+                self.change_block_state(new_block, CacheState.DRAGON_EXCLUSIVE)
+                return True
+        return False
+
+
+    def resolve_cache_miss(self, transaction):
+        tag = self.is_blocking_info['tag']
+        set_index = self.is_blocking_info['set_index']
+        new_block = CacheBlock(tag, set_index)
+        new_block.address = self.is_blocking_info['block_address']
+        new_block.address = transaction['block_address']
+        resolved = False
+        if self.is_blocking and transaction['block_address'] == self.is_blocking_info['block_address']:
+            if self.protocol == 'MESI':
+                resolved = self.resolve_mesi_miss(transaction, new_block)
+            elif self.protocol == 'Dragon':
+                resolved = self.resolve_dragon_miss(transaction, new_block)
+
+            if resolved:
+                self.is_blocking = False
+                self.cache[self.is_blocking_info['set_index']].append(new_block)
+                if self.protocol == 'Dragon' and self.is_blocking_info['operation'] == Operation.STORE and transaction['type'] in [BusTransaction.FLUSH, BusTransaction.BUS_UPDATE]:
+                    self.request_bus({'type': BusTransaction.BUS_UPDATE, 'block_address': transaction['block_address']})
+
+        return resolved
+
+
+    def snoop_mesi_other(self, transaction):
+        set_index, tag = self.address_handler.get_set_index_and_tag(transaction['block_address'])
+        block_address = transaction['block_address']
         block = self.find_block(set_index, tag)
+        if not (block or self.is_blocking):
+            return # Nothing to contribute or gain
         transaction_type = transaction['type']
 
-    def snoop_other(self, transaction):
-        set_index, tag = self.get_set_index_and_tag(transaction['address'])
-        address = transaction['address']
+        if transaction_type == BusTransaction.BUS_WRITEBACK_ACK and transaction['cpu_id'] == self.cpu_id:
+            if transaction['block_address'] == self.pending_writeback_ack_address:
+                self.handle_dram_ack()
+                return # Time to fetch the block that replaces the evicted block
+
+        if self.resolve_cache_miss(transaction):
+            return # Nothing more to do regarding this snoop
+
+        if not block or block.state == CacheState.INVALID:
+            return # Nothing more to do regarding this snoop
+
+        if transaction_type == BusTransaction.BUS_READ:
+            if not self.shared_line_asserted():
+                self.request_bus_snooping({'type': BusTransaction.FLUSH_OPT, 'block_address': block_address})
+            self.change_block_state(block, CacheState.MESI_SHARED)
+        elif transaction_type == BusTransaction.BUS_READ_X:
+            if not self.shared_line_asserted():
+                self.request_bus_snooping({'type': BusTransaction.FLUSH_OPT, 'block_address': block_address})
+            self.change_block_state(block, CacheState.INVALID)
+        elif transaction_type == BusTransaction.BUS_UPGRADE:
+            self.change_block_state(block, CacheState.INVALID)
+        elif transaction_type == BusTransaction.BUS_WRITEBACK:
+            pass
+
+    def snoop_dragon_self(self, transaction):
+        NotImplemented
+
+    def snoop_dragon_other(self, transaction):
+        set_index, tag = self.address_handler.get_set_index_and_tag(transaction['block_address'])
+        block_address = transaction['block_address']
         block = self.find_block(set_index, tag)
+        if not (block or self.is_blocking):
+            return # Nothing to contribute or gain
         transaction_type = transaction['type']
 
-        if self.protocol == 'MESI':
-            if block and not block.state == CacheState.INVALID:
-                if transaction_type == BusTransaction.BUS_READ_ADDRESS:
-                    if block.state in [CacheState.MESI_MODIFIED, CacheState.MESI_EXCLUSIVE]:
-                        self.request_bus_snooping({'type': BusTransaction.FLUSH_OPT, 'address': address})
-                elif transaction_type == BusTransaction.BUS_READ_X:
-                    if block.state in [CacheState.MESI_MODIFIED, CacheState.MESI_EXCLUSIVE]:
-                        self.request_bus_snooping({'type': BusTransaction.FLUSH_OPT, 'address': address})
-                    self.change_block_state(block, CacheState.INVALID)
-                elif transaction_type == BusTransaction.BUS_UPGRADE:
-                    self.change_block_state(block, CacheState.INVALID)
-                elif transaction_type == BusTransaction.BUS_WRITEBACK:
-                    pass
-            if self.pending_miss_info['address'] == transaction['address']:
-                if transaction_type == BusTransaction.BUS_WRITEBACK_ACK:
-                    self.handle_dram_ack()
+        if transaction_type == BusTransaction.BUS_WRITEBACK_ACK and transaction['cpu_id'] == self.cpu_id:
+            if transaction['block_address'] == self.pending_writeback_ack_address:
+                self.handle_dram_ack()
+                return # Time to fetch the block that replaces the evicted block
+
+        if self.resolve_cache_miss(transaction):
+            return # Nothing more to do regarding this snoop
+
+        if not block or block.state == CacheState.INVALID:
+            return # Nothing more to do regarding this snoop
         
-        elif self.protocol == 'Dragon':
-            if transaction_type == BusTransaction.BUS_READ_ADDRESS:
-                if block.state == CacheState.DRAGON_MODIFIED:
-                    self.change_block_state(block, CacheState.DRAGON_SHARED_MODIFIED)
-                elif block.state == CacheState.DRAGON_EXCLUSIVE:
-                    self.change_block_state(block, CacheState.DRAGON_SHARED_CLEAN)
-            elif transaction_type == BusTransaction.BUS_UPDATE:
-                if block.state == CacheState.DRAGON_SHARED_MODIFIED:
-                    self.change_block_state(block, CacheState.DRAGON_SHARED_CLEAN)
+        if transaction_type == BusTransaction.BUS_READ:
+            if not self.shared_line_asserted():
+                self.request_bus_snooping({'type': BusTransaction.FLUSH, 'block_address': block_address})
+            if block.state == CacheState.DRAGON_MODIFIED:
+                self.change_block_state(block, CacheState.DRAGON_SHARED_MODIFIED)
+            elif block.state == CacheState.DRAGON_EXCLUSIVE:
+                self.change_block_state(block, CacheState.DRAGON_SHARED_CLEAN)
+        elif transaction_type == BusTransaction.BUS_UPDATE:
+            if block.state in [CacheState.DRAGON_SHARED_MODIFIED, CacheState.DRAGON_SHARED_CLEAN]:
+                self.change_block_state(block, CacheState.DRAGON_SHARED_CLEAN)
+            else:
+                raise ValueError("BUS_UPDATE should be impossible to receive if the block is not DRAGON_SHARED_MODIFIED or DRAGON_SHARED_CLEAN")
+
+    def snoop_mesi(self, transaction):
+        if transaction['cpu_id'] == self.cpu_id and not transaction['from_dram']:
+            self.snoop_mesi_self(transaction)
+        else:
+            self.snoop_mesi_other(transaction)
+
+    def snoop_dragon(self, transaction):
+        if transaction['cpu_id'] == self.cpu_id and not transaction['from_dram']:
+            self.snoop_dragon_self(transaction)
+        else:
+            self.snoop_dragon_other(transaction)
 
     def snoop(self, transaction):
-        if transaction['cpu_id'] == self.cpu_id and not transaction['from_dram']:
-            self.snoop_self(transaction)
-        else:
-            self.snoop_other(transaction)
+        if self.protocol == 'MESI':
+            self.snoop_mesi(transaction)
+        elif self.protocol == 'Dragon':
+            self.snoop_dragon(transaction)
 
     def request_bus_snooping(self, transaction):
-        transaction['cpu_id'] = self.cpu_id
-        transaction['from_dram'] = False
-        self.bus.request(transaction)
+        transaction_copy = copy.deepcopy(transaction)
+        transaction_copy['cpu_id'] = self.cpu_id
+        transaction_copy['from_dram'] = False
+        self.bus.request(transaction_copy)
 
     def request_bus(self, transaction):
+        transaction_copy = copy.deepcopy(transaction)  # Isolated copy
         if self.is_blocking: 
             raise RuntimeError("CPU is already waiting for the bus, cannot make another request originating from the CPU")
         self.is_blocking = True # Should only block when servicing bus requests originating from the CPU
-        transaction['cpu_id'] = self.cpu_id
-        transaction['from_dram'] = False
-        self.blocking_transaction = transaction
-        self.bus.request(transaction)
-
-    def get_set_index_and_tag(self, address):
-        tag, set_index, _ = self.address_handler.parse_address(address)
-        return set_index, tag
+        transaction_copy['cpu_id'] = self.cpu_id
+        transaction_copy['from_dram'] = False
+        self.bus.request(transaction_copy)
 
     def find_block(self, set_index, tag):
         for block in self.cache[set_index]:
@@ -500,17 +594,14 @@ class CPU:
                         continue
                     instruction, value = parts
                     instructions.append((int(instruction), value))
-            return instructions[:100000]
+            return instructions
         except FileNotFoundError:
-            logging.error(f"Trace file {self.trace_file} not found.")
             sys.exit(1)
 
     def step(self):
         if self.instruction_pointer < len(self.trace):
             self.total_cycles += 1
-        else:
-            return
-
+        
         if self.compute_cycles_remaining > 0:
             self.compute_cycles_remaining -= 1
             self.compute_cycles += 1
@@ -520,10 +611,13 @@ class CPU:
             self.idle_cycles += 1
             return
 
+        if self.instruction_pointer >= len(self.trace):
+            return
+
         # We only arrive here if there are no compute cycles remaining and no outstanding memory requests
         instruction, value = self.trace[self.instruction_pointer]
         if instruction in [0, 1]: 
-            address = int(value, 16)
+            address = int(value, 16) & 0xFFFFFFFF # Ensure 32-bit
             operation = Operation.LOAD if instruction == 0 else Operation.STORE 
             self.load_store_instructions += 1
             self.cache.access(address, operation)
@@ -566,21 +660,23 @@ class Simulator:
         self.bus.caches = self.caches
 
     def run(self):
-        logging.info("Starting simulation...")
+        cycle_snapshot = {}  # Store state snapshots every 1000 cycles
         while not self.all_programs_finished():
             self.global_cycle += 1
             for cpu in self.cpus:
                 cpu.step()
-            for cache in self.bus.caches:
+            for cache in self.caches:
                 cache.step()
+            for cache in self.caches:
+                cache.shared_line = False
             self.bus.step() 
             self.dram.step()
         self.generate_report()
 
     def all_programs_finished(self):
         return all(cpu.instruction_pointer >= len(cpu.trace) and
-                   cpu.compute_cycles_remaining == 0 and
-                   not cpu.cache.is_blocking for cpu in self.cpus)
+                cpu.compute_cycles_remaining == 0 and
+                not cpu.cache.is_blocking for cpu in self.cpus)
 
     def generate_report(self):
         logging.info("Generating report...")

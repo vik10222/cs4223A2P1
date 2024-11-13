@@ -533,7 +533,7 @@ class CPU:
                         continue
                     instruction, value = parts
                     instructions.append((int(instruction), value))
-            return instructions
+            return instructions[:10000]
         except FileNotFoundError:
             logging.error(f"Trace file {self.trace_file} not found.")
             sys.exit(1)
