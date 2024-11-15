@@ -1,0 +1,64 @@
+===== Simulation Report =====
+Overall Execution Cycles: 24763728
+Total Data Traffic on Bus: 9370272 bytes
+Number of Updates: 183819
+
+--- CPU 0 ---
+Total Cycles: 24763727
+Compute Cycles: 17729254
+Load/Store Instructions: 3270132
+Idle Cycles: 7034473
+Cache Hits: 3226575
+Cache Misses: 43557
+Hit Rate: 98.67%
+Miss Rate: 1.33%
+Private Accesses: 1919518
+Shared Accesses: 1350614
+Incoming adoptions: 0
+Outgoing adoptions: 0
+
+--- CPU 1 ---
+Total Cycles: 23962250
+Compute Cycles: 17120545
+Load/Store Instructions: 3287252
+Idle Cycles: 6841705
+Cache Hits: 3242325
+Cache Misses: 44927
+Hit Rate: 98.63%
+Miss Rate: 1.37%
+Private Accesses: 1888239
+Shared Accesses: 1399013
+Incoming adoptions: 0
+Outgoing adoptions: 0
+
+--- CPU 2 ---
+Total Cycles: 17851056
+Compute Cycles: 17556877
+Load/Store Instructions: 117698
+Idle Cycles: 294179
+Cache Hits: 115971
+Cache Misses: 1727
+Hit Rate: 98.53%
+Miss Rate: 1.47%
+Private Accesses: 66988
+Shared Accesses: 50710
+Incoming adoptions: 0
+Outgoing adoptions: 0
+
+--- CPU 3 ---
+Total Cycles: 23978331
+Compute Cycles: 17140113
+Load/Store Instructions: 3324919
+Idle Cycles: 6838218
+Cache Hits: 3281752
+Cache Misses: 43167
+Hit Rate: 98.70%
+Miss Rate: 1.30%
+Private Accesses: 2015749
+Shared Accesses: 1309170
+Incoming adoptions: 0
+Outgoing adoptions: 0
+
+Sum of incoming adoptions: 0
+Sum of outgoing adoptions: 0
+=============================
