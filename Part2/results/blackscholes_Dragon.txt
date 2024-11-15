@@ -1,49 +1,64 @@
 ===== Simulation Report =====
-Overall Execution Cycles: 17281830
-Total Data Traffic on Bus: 1636908 bytes
-Number of Updates: 159915
+Overall Execution Cycles: 48210216
+Total Data Traffic on Bus: 95230816 bytes
+Number of Updates: 2965299
+
 --- CPU 0 ---
-Total Cycles: 16639946
+Total Cycles: 39819629
 Compute Cycles: 10430314
 Load/Store Instructions: 2497349
-Idle Cycles: 3712283
-Cache Hits: 2461664
-Cache Misses: 71370
-Hit Rate: 97.18%
-Miss Rate: 2.82%
-Private Accesses: 1920635
-Shared Accesses: 576714
+Idle Cycles: 29389315
+Cache Hits: 2494186
+Cache Misses: 3163
+Hit Rate: 99.87%
+Miss Rate: 0.13%
+Private Accesses: 30468
+Shared Accesses: 2466881
+Incoming adoptions: 695
+Outgoing adoptions: 357
+
 --- CPU 1 ---
-Total Cycles: 16566823
+Total Cycles: 48210215
 Compute Cycles: 10383276
 Load/Store Instructions: 2490468
-Idle Cycles: 3693079
-Cache Hits: 2455301
-Cache Misses: 70334
-Hit Rate: 97.22%
-Miss Rate: 2.78%
-Private Accesses: 1880384
-Shared Accesses: 610084
+Idle Cycles: 37826939
+Cache Hits: 2483672
+Cache Misses: 6796
+Hit Rate: 99.73%
+Miss Rate: 0.27%
+Private Accesses: 235666
+Shared Accesses: 2254802
+Incoming adoptions: 370
+Outgoing adoptions: 62
+
 --- CPU 2 ---
-Total Cycles: 17281830
+Total Cycles: 39209415
 Compute Cycles: 10430338
 Load/Store Instructions: 2509057
-Idle Cycles: 4342435
-Cache Hits: 2468371
-Cache Misses: 81372
-Hit Rate: 96.81%
-Miss Rate: 3.19%
-Private Accesses: 2040386
-Shared Accesses: 468671
+Idle Cycles: 28779077
+Cache Hits: 2506808
+Cache Misses: 2249
+Hit Rate: 99.91%
+Miss Rate: 0.09%
+Private Accesses: 1943677
+Shared Accesses: 565380
+Incoming adoptions: 47
+Outgoing adoptions: 198
+
 --- CPU 3 ---
-Total Cycles: 16659590
+Total Cycles: 38454338
 Compute Cycles: 10394904
 Load/Store Instructions: 2503127
-Idle Cycles: 3761559
-Cache Hits: 2467272
-Cache Misses: 71710
-Hit Rate: 97.18%
-Miss Rate: 2.82%
-Private Accesses: 1968777
-Shared Accesses: 534350
+Idle Cycles: 28059434
+Cache Hits: 2500137
+Cache Misses: 2990
+Hit Rate: 99.88%
+Miss Rate: 0.12%
+Private Accesses: 113210
+Shared Accesses: 2389917
+Incoming adoptions: 81
+Outgoing adoptions: 576
+
+Sum of incoming adoptions: 1193
+Sum of outgoing adoptions: 1193
 =============================
