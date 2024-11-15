@@ -2,8 +2,7 @@ import sys
 import math
 import copy
 from enum import Enum, auto
-from collections import deque, defaultdict
-from typing import Dict, List, Optional, Tuple, Set
+from collections import deque
 
 class CacheState(Enum):
     """Cache states for MESI and Dragon protocols"""
@@ -232,7 +231,7 @@ class Bus:
             return 2 * words_in_block
         raise ValueError(f"Unknown transaction type: {transaction_type}")
 
-    def update_traffic_stats(self, transaction: Dict):
+    def update_traffic_stats(self, transaction):
         transaction_type = transaction['type']
         if transaction_type == BusTransaction.DRAM_READ_ADDRESS:
             pass 
@@ -670,7 +669,7 @@ class CPU:
                     assert len(parts) == 2
                     instruction, value = parts
                     instructions.append((int(instruction), value))
-            return instructions
+            return instructions[:10000]
         except FileNotFoundError:
             sys.exit(1)
 
