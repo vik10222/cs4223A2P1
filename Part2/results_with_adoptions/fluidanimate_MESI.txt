@@ -1,64 +1,69 @@
 ===== Simulation Report =====
-Overall Execution Cycles: 15087848
-Total Data Traffic on Bus: 2129568 bytes
-Number of Invalidations: 26694
+Overall Execution Cycles: 15238394
+Total Data Traffic on Bus: 2312480 bytes
+Number of Invalidations: 30382
 
 --- CPU 0 ---
-Total Cycles: 14967911
+Total Cycles: 15145336
 Compute Cycles: 11337782
 Load/Store Instructions: 2576503
-Idle Cycles: 3630129
-Cache Hits: 2563338
-Cache Misses: 13222
-Hit Rate: 99.49%
-Miss Rate: 0.51%
-Private Accesses: 2034145
-Shared Accesses: 542358
-Incoming adoptions: 850
-Outgoing adoptions: 530
+Idle Cycles: 3807554
+Cache Hits: 2563089
+Cache Misses: 13414
+Hit Rate: 99.48%
+Miss Rate: 0.52%
+Private Accesses: 2024129
+Shared Accesses: 552374
+Incoming adoptions: 1091
+Outgoing adoptions: 735
+Useless adoptions: 245
 
 --- CPU 1 ---
-Total Cycles: 14542988
+Total Cycles: 14697624
 Compute Cycles: 11290799
 Load/Store Instructions: 2407844
-Idle Cycles: 3252189
-Cache Hits: 2396812
-Cache Misses: 11082
-Hit Rate: 99.54%
-Miss Rate: 0.46%
-Private Accesses: 1933834
-Shared Accesses: 474010
-Incoming adoptions: 596
-Outgoing adoptions: 356
+Idle Cycles: 3406825
+Cache Hits: 2396363
+Cache Misses: 11481
+Hit Rate: 99.52%
+Miss Rate: 0.48%
+Private Accesses: 1907018
+Shared Accesses: 500826
+Incoming adoptions: 494
+Outgoing adoptions: 229
+Useless adoptions: 241
 
 --- CPU 2 ---
-Total Cycles: 15087847
+Total Cycles: 15238393
 Compute Cycles: 11337671
 Load/Store Instructions: 2604189
-Idle Cycles: 3750176
-Cache Hits: 2589016
-Cache Misses: 15238
+Idle Cycles: 3900722
+Cache Hits: 2588771
+Cache Misses: 15418
 Hit Rate: 99.41%
 Miss Rate: 0.59%
-Private Accesses: 2056624
-Shared Accesses: 547565
-Incoming adoptions: 342
-Outgoing adoptions: 746
+Private Accesses: 2057906
+Shared Accesses: 546283
+Incoming adoptions: 595
+Outgoing adoptions: 1227
+Useless adoptions: 204
 
 --- CPU 3 ---
-Total Cycles: 14598132
+Total Cycles: 14761009
 Compute Cycles: 11301515
 Load/Store Instructions: 2411465
-Idle Cycles: 3296617
-Cache Hits: 2399483
-Cache Misses: 12050
-Hit Rate: 99.50%
-Miss Rate: 0.50%
-Private Accesses: 1879024
-Shared Accesses: 532441
-Incoming adoptions: 304
-Outgoing adoptions: 460
+Idle Cycles: 3459494
+Cache Hits: 2398940
+Cache Misses: 12525
+Hit Rate: 99.48%
+Miss Rate: 0.52%
+Private Accesses: 1876353
+Shared Accesses: 535112
+Incoming adoptions: 425
+Outgoing adoptions: 414
+Useless adoptions: 138
 
-Sum of incoming adoptions: 2092
-Sum of outgoing adoptions: 2092
+Sum of incoming adoptions: 2605
+Sum of outgoing adoptions: 2605
+Sum of useless adoptions: 828
 =============================

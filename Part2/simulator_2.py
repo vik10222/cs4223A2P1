@@ -115,6 +115,7 @@ class CacheStatistics:
         self.total_cycles = 0
         self.adoptions_in = 0
         self.adoptions_out = 0
+        self.useless_adoptions = 0
 
     def record_access(self, hit):
         if hit:
@@ -134,7 +135,8 @@ class CacheStatistics:
             'private_accesses': self.private_accesses,
             'shared_accesses': self.shared_accesses,
             'adoptions_in': self.adoptions_in,
-            'adoptions_out': self.adoptions_out
+            'adoptions_out': self.adoptions_out,
+            'useless_adoptions': self.useless_adoptions
         }
 
 class Bus:
@@ -183,9 +185,10 @@ class Bus:
         # here the bus acts like a simple MCU that just upgrades a flush_test to a flush
         if any(cache.shared_line for cache in self.caches):
             return # the caches handled the flush locally by adopting the evicted cache line
-        transaction = self.current_transaction
+        transaction = copy.deepcopy(self.current_transaction)
         transaction['type'] = BusTransaction.DRAM_FLUSH
-        self.grant(transaction) # can 'skip the queue' since in principle the MCU just upgrades a flush_test to a flush
+        self.dram_queue.insert(0, transaction)
+        # self.grant(transaction) # can 'skip the queue' since in principle the MCU just upgrades a flush_test to a flush
 
     def step(self):
         self.new_transaction = False
@@ -263,6 +266,8 @@ class CacheBlock:
         self.set_index = set_index
         self.state = CacheState.INVALID
         self.address = None
+        self.adopted = False
+        self.used_after_adoption = False
 
     def __eq__(self, other):
         return isinstance(other, CacheBlock) and self.tag == other.tag and self.set_index == other.set_index
@@ -289,6 +294,8 @@ class Cache:
         self.pending_writeback_ack_address = None
         self.is_resolving_cache_miss = False
         self.cache_miss_info = None
+        self.is_resolving_coherency_miss = False
+        self.pending_coherency_misses = []
 
     def find_block(self, set_index, tag):
         for block in self.cache[set_index]:
@@ -315,11 +322,19 @@ class Cache:
             self.cache[set_index].remove(block)
             self.cache[set_index].append(block)
 
-    def fill_cache(self, block_address, state):
+    def fill_cache(self, block_address, state, adoption=False):
         set_index, tag = self.address_handler.get_set_index_and_tag(block_address)
+        block = self.find_block(set_index, tag)
+        if block:
+            self.change_block_state(block, state)
+            block.adopted = adoption
+            if not adoption:
+                self.update_lru(block)
+            return
         block = CacheBlock(tag, set_index)
         block.address = block_address
         block.state = state
+        block.adopted = adoption
         if len(self.cache[set_index]) == self.associativity:
             self.cache[set_index].popleft()
         self.cache[set_index].append(block)
@@ -336,6 +351,8 @@ class Cache:
             self.process_cache_miss(set_index, tag, operation, block_address)
 
     def process_cache_hit(self, block, operation, block_address):
+        if block.adopted:
+            block.used_after_adoption = True
         self.stats.record_access(True)
         self.update_lru(block)
         if self.protocol == 'MESI':
@@ -373,6 +390,7 @@ class Cache:
             raise ValueError(f"Invalid block state: {block.state}")
 
     def process_cache_miss(self, set_index, tag, operation, block_address):
+        assert not self.is_resolving_cache_miss
         self.is_resolving_cache_miss = True
         self.stats.record_access(False)
         self.cache_miss_info = {
@@ -381,6 +399,7 @@ class Cache:
             'operation': operation,
             'block_address': block_address
         }
+
         evicted_address = self.evict_and_writeback_needed(set_index)
         if evicted_address:
             self.request_bus({'type': BusTransaction.FLUSH_TEST, 'block_address': evicted_address})
@@ -392,12 +411,11 @@ class Cache:
         if len(self.cache[set_index]) == self.associativity:
             evicted_block = self.cache[set_index][0]
             if evicted_block is None:
+                print("Weird, evicted block is None")
                 return False
             evicted_address = copy.deepcopy(evicted_block.address)
             if evicted_block.state in [CacheState.MESI_MODIFIED, CacheState.DRAGON_MODIFIED, CacheState.DRAGON_SHARED_MODIFIED]:
-                self.cache[set_index][0] = None
                 return evicted_address
-            self.cache[set_index][0] = None
         return False
 
     # successfull writeback due to eviction on cache miss
@@ -441,27 +459,49 @@ class Cache:
         block = self.find_block(set_index, tag)
         transaction_type = transaction['type']
 
+        if transaction_type == BusTransaction.MESI_READ_X and not self.shared_line_asserted_by_other_cache():
+            if block_address in self.pending_coherency_misses:
+                self.request_bus({'type': BusTransaction.DRAM_READ_ADDRESS, 'block_address': block_address})
+
         if transaction_type in [BusTransaction.READ, BusTransaction.MESI_READ_X] and not self.shared_line_asserted_by_other_cache():
             if self.is_resolving_cache_miss and transaction['block_address'] == self.cache_miss_info['block_address']:
                 # still resolving a cache miss and no other cache can help us out
                 self.request_bus({'type': BusTransaction.DRAM_READ_ADDRESS, 'block_address': block_address})
         elif transaction_type == BusTransaction.MESI_UPGRADE:
             if block.state == CacheState.INVALID: # this cache lost the data race / bus_upgrade race, need to get new priveleges
-                self.process_cache_miss(set_index, tag, Operation.STORE, block_address)
+                self.is_resolving_coherency_miss = True
+                self.pending_coherency_misses.append(block_address)
+                self.request_bus({'type': BusTransaction.MESI_READ_X, 'block_address': block_address})
             else:
                 self.change_block_state(block, CacheState.MESI_MODIFIED)
         elif transaction_type == BusTransaction.FLUSH_TEST:
             if self.shared_line_asserted_by_other_cache(): # someone adopted our block
                 self.stats.adoptions_out += 1
                 self.handle_dram_ack()
-            else:
-                pass # the MCU will turn flush_test into a flush if not adopted
+            else: # the MCU will turn flush_test into a flush if not adopted
+                if block.adopted and not block.used_after_adoption:
+                    self.stats.useless_adoptions += 1
 
     def snoop_mesi_other(self, transaction):
         set_index, tag = self.address_handler.get_set_index_and_tag(transaction['block_address'])
         block_address = transaction['block_address']
         block = self.find_block(set_index, tag)
         transaction_type = transaction['type']
+
+        if transaction_type == BusTransaction.DRAM_READ_DATA and self.is_resolving_coherency_miss:
+            if transaction['block_address'] in self.pending_coherency_misses:
+                self.pending_coherency_misses.remove(transaction['block_address'])
+                self.change_block_state(block, CacheState.MESI_MODIFIED)
+                if not self.pending_coherency_misses:
+                    self.is_resolving_coherency_miss = False
+
+        if transaction_type == BusTransaction.MESI_FLUSH_OPT:
+            if transaction['block_address'] in self.pending_coherency_misses:
+                self.pending_coherency_misses.remove(transaction['block_address'])
+                self.change_block_state(block, CacheState.MESI_MODIFIED)
+                if not self.pending_coherency_misses:
+                    self.is_resolving_coherency_miss = False
+                return
 
         if transaction_type == BusTransaction.DRAM_FLUSH_ACK and transaction['cpu_id'] == self.cpu_id:
             if transaction['block_address'] == self.pending_writeback_ack_address:
@@ -476,7 +516,7 @@ class Cache:
         if transaction_type == BusTransaction.FLUSH_TEST: # testing this first so we can do early return
             if self.shared_line:
                 self.stats.adoptions_in += 1
-                self.fill_cache(block_address, CacheState.MESI_MODIFIED)
+                self.fill_cache(block_address, CacheState.MESI_MODIFIED, adoption=True)
                 return
 
         if not block or block.state == CacheState.INVALID:
@@ -514,8 +554,9 @@ class Cache:
             if self.shared_line_asserted_by_other_cache(): # someone adopted our block
                 self.stats.adoptions_out += 1
                 self.handle_dram_ack()
-            else:
-                pass # the MCU will turn flush_test into a flush if not adopted
+            else: # the MCU will turn flush_test into a flush if not adopted
+                if block.adopted and not block.used_after_adoption:
+                    self.stats.useless_adoptions += 1
 
     def snoop_dragon_other(self, transaction):
         set_index, tag = self.address_handler.get_set_index_and_tag(transaction['block_address'])
@@ -536,7 +577,7 @@ class Cache:
         if transaction_type == BusTransaction.FLUSH_TEST: # testing this first so we can do early return
             if self.shared_line:
                 self.stats.adoptions_in += 1
-                self.fill_cache(block_address, CacheState.DRAGON_SHARED_MODIFIED)
+                self.fill_cache(block_address, CacheState.DRAGON_SHARED_MODIFIED, adoption=True)
                 return
 
         if not block:
@@ -566,7 +607,7 @@ class Cache:
         block = self.find_block(set_index, tag)
 
         if transaction['type'] == BusTransaction.FLUSH_TEST:
-            if block or len(self.cache[set_index]) < self.associativity:
+            if (block and block.address != self.pending_writeback_ack_address and block_address != self.cache_miss_info['block_address']) or len(self.cache[set_index]) < self.associativity:
                 self.shared_line = True # the cache can adopt the block if corresponding block already in cache or there is space in set
             return
 
@@ -575,6 +616,7 @@ class Cache:
             # ...in addition, this can give Sm->M in the Dragon protocol if no other cache asserts the line during a bus_update
 
     def shared_line_asserted_by_other_cache(self):
+        assert len([cache.shared_line for cache in self.bus.caches if cache.shared_line]) <= 1
         return any(cache.shared_line for cache in self.bus.caches if cache.cpu_id != self.cpu_id)
 
     def resolve_cache_miss(self, transaction):
@@ -594,7 +636,7 @@ class Cache:
 
         if resolved:
             self.is_resolving_cache_miss = False
-            self.fill_cache(block_address, new_block.state)
+            self.fill_cache(block_address, new_block.state, adoption=False)
             if self.protocol == 'Dragon' and self.cache_miss_info['operation'] == Operation.STORE and transaction['type'] == BusTransaction.DRAGON_UPDATE:
             # the cache has retrieved the block, but must send a bus update to get to Shared Modified
             # but we can un-block the cpu since the cache miss is per definition resolved
@@ -669,7 +711,7 @@ class CPU:
                     assert len(parts) == 2
                     instruction, value = parts
                     instructions.append((int(instruction), value))
-            return instructions[:10000]
+            return instructions
         except FileNotFoundError:
             sys.exit(1)
 
@@ -775,10 +817,12 @@ class Simulator:
             print(f"Private Accesses: {cache_stats['private_accesses']}")
             print(f"Shared Accesses: {cache_stats['shared_accesses']}")
             print(f"Incoming adoptions: {cache_stats['adoptions_in']}")
-            print(f"Outgoing adoptions: {cache_stats['adoptions_out']}\n")
+            print(f"Outgoing adoptions: {cache_stats['adoptions_out']}")
+            print(f"Useless adoptions: {cache_stats['useless_adoptions']}\n")
 
         print(f"Sum of incoming adoptions: {sum([cache.stats.adoptions_in for cache in self.caches])}")
         print(f"Sum of outgoing adoptions: {sum([cache.stats.adoptions_out for cache in self.caches])}")
+        print(f"Sum of useless adoptions: {sum([cache.stats.useless_adoptions for cache in self.caches])}")
         print("=============================")
 
 def main():
