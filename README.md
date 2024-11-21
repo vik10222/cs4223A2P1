@@ -23,7 +23,7 @@ This project simulates a multi-core CPU environment with L1 caches and DRAM, imp
    cd cs4223A2P1/Part2
    ```
 2. **Ensure Python version**: Python 3.10 or newer is required for this script.
-   
+
 ## Usage
 
 Run the simulator using the following command:
@@ -65,3 +65,4 @@ The simulator generates a report with the following details:
   - **Cache Hits and Misses**: Counts and rates of cache hits and misses.
   - **Private and Shared Accesses**: Breakdown of private vs. shared cache accesses.
   - **Adoptions**: Number of adoptions of cache lines between caches that mitigated a DRAM writeback/flush.
+  - **Useless adoptions**: Number of cache lines that weren't accessed before eviction after getting adopted.

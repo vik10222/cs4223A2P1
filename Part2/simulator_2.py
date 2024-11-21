@@ -1,6 +1,7 @@
 import sys
 import math
 import copy
+import argparse
 from enum import Enum, auto
 from collections import deque
 
@@ -91,7 +92,7 @@ class AddressHandler:
             raise ValueError("Block size must be a power of 2")
         if (num_sets & (num_sets - 1)) != 0:
             raise ValueError("Number of sets must be a power of 2")
-        
+
         self.num_sets = num_sets
         self.block_offset_bits = int(math.log2(block_size))
         self.index_bits = int(math.log2(num_sets))
@@ -148,7 +149,7 @@ class Bus:
 
         self.word_size = 4
         self.block_size = block_size
-        
+
         self.new_transaction = False
         self.current_transaction = None
         self.transfer_cycles_remaining = 0
@@ -168,7 +169,7 @@ class Bus:
             self.queue.append(transaction)
 
     def grant(self, transaction):
-        self.new_transaction = True # only True for first cycle, to trigger cache snooping
+        self.new_transaction = True # only True for first cycle, to trigger cache snooping for Cache and DRAM
         self.current_transaction = transaction
         self.update_traffic_stats(transaction)
         self.transfer_cycles_remaining = self.calculate_transfer_cycles(transaction) - 1 # -1 to account for current cycle
@@ -188,7 +189,6 @@ class Bus:
         transaction = copy.deepcopy(self.current_transaction)
         transaction['type'] = BusTransaction.DRAM_FLUSH
         self.dram_queue.insert(0, transaction)
-        # self.grant(transaction) # can 'skip the queue' since in principle the MCU just upgrades a flush_test to a flush
 
     def step(self):
         self.new_transaction = False
@@ -204,7 +204,7 @@ class Bus:
         if self.dram_queue:
             self.grant(self.dram_queue.popleft())
             return
-        
+
         if self.queue:
             self.grant(self.queue.popleft())
             return
@@ -227,7 +227,7 @@ class Bus:
         elif transaction_type == BusTransaction.MESI_READ_X:
             return 1
         elif transaction_type == BusTransaction.MESI_UPGRADE:
-            return 1 
+            return 1
         elif transaction_type == BusTransaction.MESI_FLUSH_OPT:
             return 2 * words_in_block
         elif transaction_type == BusTransaction.DRAGON_UPDATE:
@@ -237,7 +237,7 @@ class Bus:
     def update_traffic_stats(self, transaction):
         transaction_type = transaction['type']
         if transaction_type == BusTransaction.DRAM_READ_ADDRESS:
-            pass 
+            pass
         elif transaction_type == BusTransaction.DRAM_READ_DATA:
             self.stats['data_traffic'] += self.block_size
         elif transaction_type == BusTransaction.DRAM_FLUSH:
@@ -279,7 +279,7 @@ class Cache:
     def __init__(self, cpu_id, size, block_size, associativity, bus, protocol):
         self.cpu_id = cpu_id
         self.stats = CacheStatistics()
-        self.protocol = protocol 
+        self.protocol = protocol
 
         self.bus = bus
         self.word_size = 4 # 32 bit architecture
@@ -404,7 +404,7 @@ class Cache:
         if evicted_address:
             self.request_bus({'type': BusTransaction.FLUSH_TEST, 'block_address': evicted_address})
             return # Will request block after successful writeback
-        # No eviction
+        # no eviction or no need to writeback, just request the block
         self.request_block_on_miss()
 
     def evict_and_writeback_needed(self, set_index):
@@ -582,7 +582,7 @@ class Cache:
 
         if not block:
             return # nothing the cache can help out with
-        
+
         if transaction_type == BusTransaction.READ:
             if not self.shared_line_asserted_by_other_cache(): # we help out
                 self.request_bus({'type': BusTransaction.DRAGON_UPDATE, 'block_address': block_address})
@@ -691,7 +691,7 @@ class CPU:
         self.compute_cycles = 0
         self.idle_cycles = 0
         self.load_store_instructions = 0
-        
+
         self.instruction_pointer = 0
         self.compute_cycles_remaining = 0
 
@@ -718,7 +718,7 @@ class CPU:
     def step(self):
         if self.instruction_pointer < len(self.trace):
             self.stats['total_cycles'] += 1
-        
+
         if self.compute_cycles_remaining > 0:
             self.compute_cycles_remaining -= 1
             self.stats['compute_cycles'] += 1
@@ -734,13 +734,13 @@ class CPU:
 
         # We only arrive here if there are no compute cycles remaining and no outstanding memory requests
         instruction, value = self.trace[self.instruction_pointer]
-        if instruction in [0, 1]: 
+        if instruction in [0, 1]:
             address = int(value, 16) & 0xFFFFFFFF # Ensure 32-bit
-            operation = Operation.LOAD if instruction == 0 else Operation.STORE 
+            operation = Operation.LOAD if instruction == 0 else Operation.STORE
             self.stats['load_store_instructions'] += 1
             self.cache.access_cache(address, operation)
             self.stats['idle_cycles'] += 1 # Always 1 (cache hit) or more (cache miss) idle cycles during load/store
-        elif instruction == 2: 
+        elif instruction == 2:
             cycles = int(value, 16)
             self.compute_cycles_remaining = cycles - 1 # Subtract 1 for the current cycle
             self.stats['compute_cycles'] += 1
@@ -769,7 +769,7 @@ class Simulator:
             cpu = CPU(i, cache, trace_file)
             self.caches.append(cache)
             self.cpus.append(cpu)
-        
+
         # Initialize cross-references
         self.initialize_connections()
 
@@ -786,7 +786,7 @@ class Simulator:
                 cache.step()
             for cache in self.caches:
                 cache.shared_line = False
-            self.bus.step() 
+            self.bus.step()
             self.dram.step()
         self.generate_report()
 
@@ -797,12 +797,12 @@ class Simulator:
         print("===== Simulation Report =====")
         print(f"Overall Execution Cycles: {self.global_cycle}")
         print(f"Total Data Traffic on Bus: {self.bus.stats['data_traffic']} bytes")
-        
+
         if self.protocol == "MESI":
             print(f"Number of Invalidations: {self.bus.stats['invalidations']}\n")
         elif self.protocol == "Dragon":
             print(f"Number of Updates: {self.bus.stats['updates']}\n")
-        
+
         for cpu in self.cpus:
             cache_stats = cpu.cache.stats.get_stats()
             print(f"--- CPU {cpu.cpu_id} ---")
@@ -826,8 +826,6 @@ class Simulator:
         print("=============================")
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(description='Cache Coherence Simulator')
     parser.add_argument('protocol', type=str, choices=['MESI', 'Dragon'], help='Coherence protocol (e.g., MESI, Dragon)')
     parser.add_argument('input_file', type=str, help='Input benchmark name (e.g., bodytrack)')
